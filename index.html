@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-title" content="Warden" />
+<title>Warden — Family Dashboard</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+<style>
+  :root { color-scheme: light dark; --bg:#0d1b2a; --card:#16273c; --fg:#eaf1fb; --muted:#9fb3cc; --accent:#4f9cf9; --ok:#4caf50; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:16px 18px; font-weight:700; font-size:18px; border-bottom:1px solid #22364f; display:flex; justify-content:space-between; align-items:center; }
+  header small { font-weight:400; color:var(--muted); font-size:12px; }
+  .wrap { padding:16px; max-width:640px; margin:0 auto; }
+  .card { background:var(--card); border-radius:14px; padding:16px; margin-bottom:16px; }
+  h2 { font-size:14px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin:0 0 10px; }
+  #map { height:300px; border-radius:12px; margin-bottom:10px; background:#0a1420; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:10px; padding:12px 16px; font-size:16px; font-weight:600; width:100%; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--accent); }
+  .code { font-size:40px; font-weight:800; letter-spacing:.08em; text-align:center; margin:12px 0; }
+  .big { font-size:34px; font-weight:800; }
+  .muted { color:var(--muted); font-size:13px; }
+  .row { display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid #22364f; }
+  .row:last-child { border-bottom:0; }
+  input { width:100%; padding:12px; font-size:18px; border-radius:10px; border:1px solid #33507a; background:#0e1c2e; color:var(--fg); text-transform:uppercase; letter-spacing:.1em; text-align:center; }
+  a { color:var(--accent); }
+  .hidden { display:none !important; }
+  .pill { font-size:12px; color:var(--muted); }
+  .err { color:#ff8a80; font-size:13px; margin-top:8px; }
+</style>
+</head>
+<body>
+<header>
+  <span>🛡️ Warden</span>
+  <small id="status">connecting…</small>
+</header>
+<div class="wrap">
+
+  <!-- Pairing -->
+  <div id="pairView" class="card hidden">
+    <h2>Pair with your child's phone</h2>
+    <p class="muted">Create a pairing code, then enter it on the child's phone under <b>Settings → Family sharing</b>. Their location and screen time appear here once they turn sharing on.</p>
+    <div id="codeBox" class="hidden">
+      <div class="code" id="codeText">——</div>
+      <p class="muted" style="text-align:center">Enter this on the child's phone.</p>
+      <button id="toDash">Continue to dashboard</button>
+    </div>
+    <div id="createBox">
+      <button id="createBtn">Create pairing code</button>
+      <p class="muted" style="text-align:center;margin-top:14px">Already have a code?</p>
+      <input id="joinInput" placeholder="ENTER CODE" maxlength="8" />
+      <button class="secondary" id="joinBtn" style="margin-top:8px">Use this code</button>
+    </div>
+    <div class="err" id="pairErr"></div>
+  </div>
+
+  <!-- Dashboard -->
+  <div id="dashView" class="hidden">
+    <div class="card">
+      <h2>Location</h2>
+      <div id="map"></div>
+      <div id="locDetail" class="muted">Waiting for the child to turn on “Share location”…</div>
+      <div style="margin-top:10px"><a id="mapsLink" href="#" target="_blank" rel="noopener">Open in Google Maps ↗</a></div>
+    </div>
+    <div class="card">
+      <h2>Screen time today</h2>
+      <div id="stEmpty" class="muted">Waiting for the child to turn on “Share screen time”…</div>
+      <div id="stBody" class="hidden">
+        <div class="big" id="stTotal">—</div>
+        <div class="muted" id="stUnlocks"></div>
+        <div id="stApps" style="margin-top:12px"></div>
+      </div>
+    </div>
+    <p class="pill">Paired · code <span id="pairPill"></span> · <a href="#" id="unpair">unpair</a></p>
+  </div>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+const API_KEY = "AIzaSyDwc008ZFhACwUkR8BG9atzqR8tNJWsTgU";
+const PROJECT_ID = "warden-40546";
+const FS = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
+const ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+
+const LS = {
+  get: k => { try { return localStorage.getItem(k); } catch(e){ return null; } },
+  set: (k,v) => { try { localStorage.setItem(k,v); } catch(e){} },
+  del: k => { try { localStorage.removeItem(k); } catch(e){} },
+};
+
+let idToken = null, refreshToken = LS.get("w_refresh"), uid = LS.get("w_uid");
+let pairId = LS.get("w_pair");
+let map, marker, pollTimer;
+
+const $ = id => document.getElementById(id);
+const setStatus = t => $("status").textContent = t;
+
+async function signIn() {
+  if (refreshToken) {
+    const r = await fetch(`https://securetoken.googleapis.com/v1/token?key=${API_KEY}`, {
+      method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"},
+      body:`grant_type=refresh_token&refresh_token=${encodeURIComponent(refreshToken)}`
+    });
+    if (r.ok) { const d = await r.json(); idToken = d.id_token; refreshToken = d.refresh_token; uid = d.user_id;
+      LS.set("w_refresh",refreshToken); LS.set("w_uid",uid); return; }
+  }
+  const r = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${API_KEY}`, {
+    method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({returnSecureToken:true})
+  });
+  if (!r.ok) throw new Error("auth failed ("+r.status+")");
+  const d = await r.json(); idToken = d.idToken; refreshToken = d.refreshToken; uid = d.localId;
+  LS.set("w_refresh",refreshToken); LS.set("w_uid",uid);
+}
+
+function authHeaders(){ return { "Authorization":"Bearer "+idToken, "Content-Type":"application/json" }; }
+
+function randCode(n=8){ let s=""; const a=new Uint32Array(n); crypto.getRandomValues(a);
+  for (let i=0;i<n;i++) s+=ALPHABET[a[i]%ALPHABET.length]; return s; }
+
+async function registerMember(pid){
+  const r = await fetch(`${FS}/families/${pid}/members/${uid}`, {
+    method:"PATCH", headers:authHeaders(),
+    body: JSON.stringify({ fields:{ role:{stringValue:"PARENT"} } })
+  });
+  return r.ok;
+}
+
+// Firestore typed-value -> JS
+function val(v){
+  if (v==null) return null;
+  if ("doubleValue" in v) return Number(v.doubleValue);
+  if ("integerValue" in v) return Number(v.integerValue);
+  if ("stringValue" in v) return v.stringValue;
+  if ("booleanValue" in v) return v.booleanValue;
+  if ("mapValue" in v) { const o={}; for (const k in (v.mapValue.fields||{})) o[k]=val(v.mapValue.fields[k]); return o; }
+  if ("arrayValue" in v) return (v.arrayValue.values||[]).map(val);
+  return null;
+}
+function fields(doc){ const o={}; for (const k in (doc.fields||{})) o[k]=val(doc.fields[k]); return o; }
+
+async function getDoc(path){
+  const r = await fetch(`${FS}/${path}`, { headers:authHeaders() });
+  if (r.status===401){ await signIn(); return getDoc(path); }
+  if (!r.ok) return null;
+  return fields(await r.json());
+}
+
+function todayStr(){ const d=new Date(); const p=n=>String(n).padStart(2,"0");
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}`; }
+
+function fmtDur(s){ s=Math.round(s||0); const h=Math.floor(s/3600), m=Math.floor((s%3600)/60);
+  return h>0?`${h}h ${m}m`:(m>0?`${m}m`:`${s}s`); }
+
+async function refreshData(){
+  if (!pairId) return;
+  const loc = await getDoc(`families/${pairId}/child_live/current`);
+  if (loc && loc.lat!=null && loc.lng!=null){
+    const when = new Date(loc.ts||Date.now()).toLocaleString();
+    $("locDetail").innerHTML = `<b>${loc.lat.toFixed(5)}, ${loc.lng.toFixed(5)}</b><br>Updated ${when} · ±${Math.round(loc.accuracyM||0)} m`
+      + (loc.batteryPct>=0?` · battery ${loc.batteryPct}%`:"");
+    $("mapsLink").href = `https://www.google.com/maps/search/?api=1&query=${loc.lat},${loc.lng}`;
+    showMap(loc.lat, loc.lng);
+    reverseGeocode(loc.lat, loc.lng);
+  }
+  const u = await getDoc(`families/${pairId}/child_usage/${todayStr()}`);
+  if (u && u.totalSeconds!=null){
+    $("stEmpty").classList.add("hidden"); $("stBody").classList.remove("hidden");
+    $("stTotal").textContent = fmtDur(u.totalSeconds);
+    $("stUnlocks").textContent = `${u.unlocks||0} unlocks`;
+    const apps = (u.apps||[]).slice(0,8).map(a =>
+      `<div class="row"><span>${(a.label||a.packageName||"").toString().replace(/[<>]/g,"")}</span><span class="muted">${fmtDur(a.seconds)}</span></div>`).join("");
+    $("stApps").innerHTML = apps;
+  }
+  setStatus("live");
+}
+
+function showMap(lat,lng){
+  if (!map){
+    map = L.map("map").setView([lat,lng], 15);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+      { maxZoom:19, attribution:"© OpenStreetMap" }).addTo(map);
+    marker = L.marker([lat,lng]).addTo(map);
+  } else { marker.setLatLng([lat,lng]); map.setView([lat,lng]); }
+}
+
+async function reverseGeocode(lat,lng){
+  try{
+    const r = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}`,
+      { headers:{ "Accept":"application/json" } });
+    if (r.ok){ const d = await r.json(); if (d.display_name)
+      $("locDetail").innerHTML = `<b>${d.display_name}</b><br>` + $("locDetail").innerHTML; }
+  }catch(e){}
+}
+
+function showPair(){ $("pairView").classList.remove("hidden"); $("dashView").classList.add("hidden"); }
+function showDash(){
+  $("pairView").classList.add("hidden"); $("dashView").classList.remove("hidden");
+  $("pairPill").textContent = pairId;
+  refreshData();
+  clearInterval(pollTimer); pollTimer = setInterval(refreshData, 30000);
+  setTimeout(()=>{ if(map) map.invalidateSize(); }, 200);
+}
+
+$("createBtn").onclick = async () => {
+  $("pairErr").textContent = "";
+  try {
+    const pid = randCode(8);
+    if (await registerMember(pid)) {
+      pairId = pid; LS.set("w_pair", pid);
+      $("codeText").textContent = pid; $("codeBox").classList.remove("hidden"); $("createBox").classList.add("hidden");
+    } else $("pairErr").textContent = "Couldn't create the code. Check your connection.";
+  } catch(e){ $("pairErr").textContent = e.message; }
+};
+$("joinBtn").onclick = async () => {
+  const pid = ($("joinInput").value||"").toUpperCase().replace(/[^A-Z0-9]/g,"").slice(0,8);
+  if (pid.length < 6) { $("pairErr").textContent = "Enter the full code."; return; }
+  if (await registerMember(pid)) { pairId = pid; LS.set("w_pair", pid); showDash(); }
+  else $("pairErr").textContent = "Couldn't use that code.";
+};
+$("toDash").onclick = showDash;
+$("unpair").onclick = (e) => { e.preventDefault(); LS.del("w_pair"); pairId=null;
+  $("codeBox").classList.add("hidden"); $("createBox").classList.remove("hidden"); showPair(); };
+
+(async function init(){
+  try {
+    setStatus("signing in…");
+    await signIn();
+    setStatus("ready");
+    if (pairId) { await registerMember(pairId); showDash(); }
+    else showPair();
+  } catch(e){ setStatus("error"); showPair(); $("pairErr").textContent = e.message + " — if this persists, the Firebase API key may be restricted."; }
+})();
+</script>
+</body>
+</html>
